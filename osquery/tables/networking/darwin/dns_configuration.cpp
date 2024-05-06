@@ -1,8 +1,9 @@
-#include <iostream>
-#include <sstream>
-#include <stdio.h>
-#include <string>
-#include <vector>
+#include <cstdio> // For popen, pclose
+#include <sstream> // For istringstream
+#include <stdexcept> // For runtime_error
+#include <string> // For string handling
+#include <vector> // For vector
+#include <memory> // For unique_ptr
 
 #include <boost/algorithm/string.hpp>
 
@@ -17,7 +18,6 @@
 namespace osquery {
 namespace tables {
 
-// A simple structure to hold DNS resolver information
 struct DNSResolver {
   std::string index;
   std::string domain;
@@ -30,30 +30,25 @@ struct DNSResolver {
   std::vector<std::string> searchDomains;
 };
 
-// Function to execute a command and return its output
-std::string execCommand(const char* cmd) {
-  char buffer[128];
-  std::string result = "";
-  FILE* pipe = popen(cmd, "r");
-  if (!pipe)
-    throw std::runtime_error("popen() failed!");
-  try {
-    while (fgets(buffer, sizeof buffer, pipe) != NULL) {
-      result += buffer;
-    }
-  } catch (...) {
-    pclose(pipe);
-    throw;
+// Function to execute a shell command and return its output
+std::string executeShellCommand(const char* cmd) {
+  std::array<char, 128> buffer;
+  std::string result;
+  std::unique_ptr<FILE, decltype(&pclose)> pipe(popen(cmd, "r"), pclose);
+  if (!pipe) {
+    LOG(ERROR) << "popen() failed!";
+    throw std::runtime_error("Failed to open pipe for command execution.");
   }
-  pclose(pipe);
+  while (fgets(buffer.data(), buffer.size(), pipe.get()) != nullptr) {
+    result += buffer.data();
+  }
   return result;
 }
 
-bool containsValue(const std::string& key, const std::string& keyValue) {
+bool containsSubstring(const std::string& key, const std::string& keyValue) {
   return key.find(keyValue) != std::string::npos;
 }
 
-// Function to parse the output of `scutil --dns`
 std::vector<DNSResolver> parseDNSOutput(const std::string& output) {
   std::vector<DNSResolver> resolvers;
   std::istringstream stream(output);
@@ -61,15 +56,12 @@ std::vector<DNSResolver> parseDNSOutput(const std::string& output) {
   DNSResolver currentResolver;
 
   while (getline(stream, line)) {
-    if (containsValue(line, "resolver")) {
+    if (containsSubstring(line, "resolver #")) {
       if (!currentResolver.index.empty()) {
         resolvers.push_back(currentResolver);
         currentResolver = DNSResolver();
       }
-      size_t pos = line.find_first_of("#");
-      if (pos != std::string::npos) {
-        currentResolver.index = line.substr(pos + 1);
-      }
+      currentResolver.index = line.substr(line.find_first_of("#") + 1);
       continue;
     }
 
@@ -78,21 +70,21 @@ std::vector<DNSResolver> parseDNSOutput(const std::string& output) {
       std::string key = line.substr(0, pos);
       std::string value = line.substr(pos + 2);
 
-      if (containsValue(key, "nameserver")) {
+      if (containsSubstring(key, "nameserver")) {
         currentResolver.nameservers.push_back(value);
-      } else if (containsValue(key, "search domain")) {
+      } else if (containsSubstring(key, "search domain")) {
         currentResolver.searchDomains.push_back(value);
-      } else if (containsValue(key, "domain")) {
+      } else if (containsSubstring(key, "domain")) {
         currentResolver.domain = value;
-      } else if (containsValue(key, "if_index")) {
-        currentResolver.ifIndex = value.substr(0, value.find_last_of("(") - 1);
-      } else if (containsValue(key, "flags")) {
+      } else if (containsSubstring(key, "if_index")) {
+        currentResolver.ifIndex = value.substr(0, value.find_last_not_of(" ") + 1);
+      } else if (containsSubstring(key, "flags")) {
         currentResolver.flags = value;
-      } else if (containsValue(key, "reach")) {
+      } else if (containsSubstring(key, "reach")) {
         currentResolver.reach = value;
-      } else if (containsValue(key, "order")) {
+      } else if (containsSubstring(key, "order")) {
         currentResolver.order = value;
-      } else if (containsValue(key, "timeout")) {
+      } else if (containsSubstring(key, "timeout")) {
         currentResolver.timeout = value;
       }
     }
@@ -108,7 +100,7 @@ QueryData genDNSConfiguration(QueryContext& context) {
   QueryData results;
 
   try {
-    std::string output = execCommand("scutil --dns");
+    std::string output = executeShellCommand("scutil --dns");
     std::vector<DNSResolver> resolvers = parseDNSOutput(output);
 
     for (const auto& resolver : resolvers) {
@@ -123,15 +115,11 @@ QueryData genDNSConfiguration(QueryContext& context) {
       r["search_domains"] = osquery::join(resolver.searchDomains, ", ");
       results.push_back(r);
     }
-
-    return results;
   } catch (const std::exception& e) {
-    LOG(ERROR) << "Failed running scutil --dns";
-    LOG(ERROR) << e.what();
-    return {};
+    LOG(ERROR) << "Failed running scutil --dns: " << e.what();
   }
 
-  return {};
+  return results;
 }
 
 } // namespace tables
